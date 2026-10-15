@@ -149,12 +149,18 @@ async function withWaylandEnvironment(desktop, callback) {
   const previous = {
     XDG_SESSION_TYPE: process.env.XDG_SESSION_TYPE,
     XDG_CURRENT_DESKTOP: process.env.XDG_CURRENT_DESKTOP,
+    XDG_SESSION_DESKTOP: process.env.XDG_SESSION_DESKTOP,
+    DESKTOP_SESSION: process.env.DESKTOP_SESSION,
+    SWAYSOCK: process.env.SWAYSOCK,
     WAYLAND_DISPLAY: process.env.WAYLAND_DISPLAY,
     HYPRLAND_INSTANCE_SIGNATURE: process.env.HYPRLAND_INSTANCE_SIGNATURE,
     DISPLAY: process.env.DISPLAY,
   };
   process.env.XDG_SESSION_TYPE = "wayland";
   process.env.XDG_CURRENT_DESKTOP = desktop;
+  delete process.env.XDG_SESSION_DESKTOP;
+  delete process.env.DESKTOP_SESSION;
+  delete process.env.SWAYSOCK;
   process.env.WAYLAND_DISPLAY = "wayland-1";
   delete process.env.DISPLAY;
   if (desktop === "Hyprland") process.env.HYPRLAND_INSTANCE_SIGNATURE = "test";
@@ -696,6 +702,111 @@ test("KDE tries portal before uinput", async () => {
     ]
   );
 });
+
+for (const [windowClass, expectedFlag] of [
+  ["code", "--shift-insert"],
+  [" Code ", "--shift-insert"],
+  ["code-insiders", "--shift-insert"],
+  ["code-oss", "--shift-insert"],
+  ["com.microsoft.vscode", "--shift-insert"],
+  [" Com.Microsoft.VSCode ", "--shift-insert"],
+  ["konsole", "--shift-insert"],
+  [null, "--shift-insert"],
+  ["kitty", "--terminal"],
+  ["firefox", null],
+  ["my-code-editor", null],
+  ["com.microsoft.vscode-other", null],
+  ["decode", null],
+]) {
+  test(`KDE portal chooses the paste shortcut for ${JSON.stringify(windowClass)} without an X11 PID`, async () => {
+    const calls = [];
+    const TestClipboardManager = loadClipboardManager({ spawn: createSuccessfulSpawn(calls) });
+    const manager = new TestClipboardManager();
+    manager.commandExists = () => false;
+    manager.resolveLinuxFastPasteBinary = () => "/tmp/linux-fast-paste";
+    manager._readPortalToken = () => null;
+    manager._detectKdeWindowClass = () => windowClass;
+
+    await withWaylandEnvironment("KDE", () => manager.pasteLinux(null));
+
+    assert.deepEqual(calls, [
+      {
+        command: "/tmp/linux-fast-paste",
+        args: ["--portal", ...(expectedFlag ? [expectedFlag] : [])],
+      },
+    ]);
+    // VS Code's editor is not a terminal; do not change copy classification.
+    if (
+      windowClass?.trim().toLowerCase().startsWith("code") ||
+      windowClass?.trim().toLowerCase() === "com.microsoft.vscode"
+    ) {
+      assert.equal(manager.isLinuxTerminalWindowClass(windowClass), false);
+    }
+  });
+}
+
+test("VS Code uses Shift+Insert through wtype without process metadata", async () => {
+  const calls = [];
+  const TestClipboardManager = loadClipboardManager({ spawn: createSuccessfulSpawn(calls) });
+  const manager = new TestClipboardManager();
+  manager.commandExists = (command) => command === "wtype";
+  manager.resolveLinuxFastPasteBinary = () => null;
+  manager._detectHyprlandWindowClass = () => "code";
+
+  await withWaylandEnvironment("Hyprland", () => manager.pasteLinux(null));
+
+  assert.deepEqual(calls, [
+    {
+      command: "wtype",
+      args: ["-M", "shift", "-k", "Insert", "-m", "shift"],
+    },
+  ]);
+});
+
+for (const usePortal of [true, false]) {
+  test(`VS Code uses Shift+Insert via ${usePortal ? "portal" : "xdotool"} when /proc metadata is unreadable`, async (t) => {
+    const fs = require("node:fs");
+    const readFileSync = fs.readFileSync;
+    const readlinkSync = fs.readlinkSync;
+    t.mock.method(fs, "readFileSync", function (file, ...args) {
+      if (file === "/proc/424242/comm") throw new Error("permission denied");
+      return readFileSync.call(this, file, ...args);
+    });
+    t.mock.method(fs, "readlinkSync", function (file, ...args) {
+      if (file === "/proc/424242/exe") throw new Error("permission denied");
+      return readlinkSync.call(this, file, ...args);
+    });
+    const calls = [];
+    const TestClipboardManager = loadClipboardManager({
+      spawn: createSuccessfulSpawn(calls),
+      spawnSync: (command, args) => {
+        assert.equal(command, "xdotool");
+        const values = {
+          getactivewindow: "123",
+          getwindowclassname: "Code",
+          getwindowpid: "424242",
+        };
+        assert.ok(Object.hasOwn(values, args[0]));
+        return { status: 0, stdout: Buffer.from(values[args[0]]) };
+      },
+    });
+    const manager = new TestClipboardManager();
+    manager.commandExists = (command) => command === "xdotool";
+    manager.resolveLinuxFastPasteBinary = () => (usePortal ? "/tmp/linux-fast-paste" : null);
+    manager._readPortalToken = () => null;
+
+    await withWaylandEnvironment("KDE", () => {
+      process.env.DISPLAY = ":99";
+      return manager.pasteLinux(null);
+    });
+
+    assert.deepEqual(calls, [
+      usePortal
+        ? { command: "/tmp/linux-fast-paste", args: ["--portal", "--shift-insert"] }
+        : { command: "xdotool", args: ["windowactivate", "--sync", "123", "key", "shift+Insert"] },
+    ]);
+  });
+}
 
 test("portal exit zero succeeds with or without a restore token", async () => {
   const calls = [];
